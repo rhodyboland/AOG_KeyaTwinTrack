@@ -1,4 +1,4 @@
-﻿#ifndef zCANBUS_H
+#ifndef zCANBUS_H
 #define zCANBUS_H
 uint8_t keyaAbsolutePositionMode[] = { 0x03, 0x0D, 0x20, 0x31, 0x00, 0x00, 0x00, 0x00 };
 uint8_t keyaResetPosition[] = { 0x23, 0x0c, 0x20, 0x09, 0x00, 0x00, 0x00, 0x00 };
@@ -56,7 +56,7 @@ int16_t degreesToPosition(float degrees) {
 		return (int16_t)(units - 0.5f);
 }
 
-float positionToDegrees(int16_t position) {
+float positionToDegrees(float position) {
 	const float UNITS_PER_REV = 10000.0f;
 	const float DEGREES_PER_REV = 360.0f;
 
@@ -74,6 +74,7 @@ void CAN_Setup()
 	KeyaBusSendData.id = KeyaID;
 	KeyaBusSendData.flags.extended = true;
 	KeyaBusSendData.len = 8;
+    KeyaBusSendData.seq = true; // Preserve speed/target/enable order.
 	memcpy(KeyaBusSendData.buf, keyaAbsolutePositionMode, 8);
 	Keya_Bus.write(KeyaBusSendData);
 	Serial.println("Setting position mode (RAM)");
@@ -88,14 +89,6 @@ static inline void packKeya32(int32_t value, uint8_t* buf)
 	buf[7] = (uint8_t)((value >> 16) & 0xFF);  // DATA_H(L)
 }
 
-static void dumpBuf(uint8_t* buf) {
-	for (size_t i = 0; i < 8; i++) {
-		if (i > 0) Serial.print(" ");
-		if (buf[i] < 0x10) Serial.print("0");
-		Serial.print(buf[i], HEX);
-	}
-}
-
 void KeyaBus_Receive()
 {
 	CAN_message_t KeyaBusReceiveData;
@@ -103,7 +96,7 @@ void KeyaBus_Receive()
 	{
 		// Heartbeat
 
-		if (KeyaBusReceiveData.id == 0x07000001)
+		if (KeyaBusReceiveData.id == 0x07000001 && KeyaBusReceiveData.flags.extended && KeyaBusReceiveData.len == 8)
 		{
 			lastKeyaHeatbeat = 0;
 
@@ -124,7 +117,7 @@ void KeyaBus_Receive()
 			}
 
 			keyaCurrentActualSpeed = (int16_t)((int16_t)KeyaBusReceiveData.buf[2] << 8 | (int16_t)KeyaBusReceiveData.buf[3]);
-			int16_t current = (int16_t)((int16_t)KeyaBusReceiveData.buf[4] << 8 | (int16_t)KeyaBusReceiveData.buf[5]);
+			// Current bytes are not used by the upstream speed-mismatch takeover heuristic.
 
 			// do this with an "error margin" or checking the error flag instead?
 
@@ -169,6 +162,7 @@ void KeyaBus_Receive()
 						// else Serial.println("Enabled \t");
 
 						// check if there's any motor diag/error data and parse it
+            keyaMotorFault = (KeyaBusReceiveData.buf[7] & 0xFE) != 0 || KeyaBusReceiveData.buf[6] != 0;
 			if (KeyaBusReceiveData.buf[7] > 1 || KeyaBusReceiveData.buf[6] > 0)
 			{
 				if (bitRead(KeyaBusReceiveData.buf[7], 1)) Serial.print("Over voltage\t");
@@ -199,79 +193,76 @@ void KeyaBus_Receive()
 	}
 }
 
+// Keep the upstream 100 ms speed-to-position settling interval, but never
+// block processing of stop, OFF, timeout or takeover events during that interval.
 void SteerKeya(bool intendToSteer)
 {
-	if (keyaDetected)
-	{
-		int16_t actualSpeed;
-		uint16_t speedToSet = (uint16_t)(((uint32_t)steerSettings.AckermanFix * 10000u + 127u) / 200u); // rounded
-		//Serial.print("AckermanFix: ");
-		//Serial.print(steerSettings.AckermanFix);
-		//Serial.println(" Setting speed to " + String(speedToSet));
-		if (updateRawPositionOffset) {
-			Serial.println("Updating Keya Center Offset to current position");
-			memcpy(KeyaBusSendData.buf, keyaResetPosition, 8);
-			sendKeyaCommand();
-			sendHardwareMessage("Updated Keya Center Offset to current position", 2);
-			updateRawPositionOffset = false;
-			return;
-		}
-		if (!intendToSteer) {
-			memcpy(KeyaBusSendData.buf, keyaDisableCommand, 8);
-			sendKeyaCommand();
-			actualSpeed = 0;
-		}
-		else {
-			// Speed
-			Serial.print("Sent speed: ");
-			memcpy(KeyaBusSendData.buf, keyaSpeedCommand, 4);
-			packKeya32((int32_t)speedToSet, KeyaBusSendData.buf);
-			dumpBuf(KeyaBusSendData.buf);
-			sendKeyaCommand();
-			// 500
-			//int16_t slack = ((2 / steerSettings.steerSensorCounts) * 100);
-			int16_t slack = ((2 / steerSettings.AckermanFix) * 100);
-			if (intendedSteerAngle < 0) {
-				slack *= -1;
-			}
-			intendedSteerAngle = (steerAngleSetPoint * -1) + slack;  // left is right in position-mode
-			intendedAngleConverted = degreesToPosition(intendedSteerAngle + KeyaCenterOffset);
-			if (debugKeya) {
-				//Serial.print("Steer Angle Setpoint: ");
-				//Serial.print(steerAngleSetPoint);
-				//Serial.print(" intendedAngleConverted: ");
-				//Serial.print(intendedAngleConverted);
-				//Serial.print(" / 0x");
-				//Serial.print((uint16_t)intendedAngleConverted, HEX);
-				//Serial.print(" ");
-			}
-			delay(100);
+    static bool enabled = false, waiting = false, disabledSent = false;
+    static uint32_t speedSentAt = 0, lastTargetAt = 0, lastDisableAt = 0;
+    static float lastTarget = 0, lastScale = 0;
+    static uint16_t lastSpeed = 0;
+    const uint32_t now = millis();
 
-			// Position
-			Serial.print(" Sent position: ");
-			memcpy(KeyaBusSendData.buf, keyaPositionCommand, 4);
-			packKeya32((int32_t)intendedAngleConverted, KeyaBusSendData.buf);
-			dumpBuf(KeyaBusSendData.buf);
-			sendKeyaCommand();
+    // Disable is unconditional: heartbeat loss must not suppress a release
+    // attempt. Repeat at 10 Hz, including after a motor reconnects.
+    if (!intendToSteer) {
+        waiting = false;
+        if (!disabledSent || enabled || uint32_t(now - lastDisableAt) >= 100) {
+            memcpy(KeyaBusSendData.buf, keyaDisableCommand, 8);
+            if (!Keya_Bus.write(KeyaBusSendData)) return; // Retry next loop.
+            lastDisableAt = now;
+            disabledSent = true;
+            enabled = false;
+            keyaTxFault = false; // Gate has already latched off before this release attempt.
+        }
+        // A reset must never replace the disable frame. Only service a
+        // calibration request while disabled; reset itself does not enable.
+        if (updateRawPositionOffset && keyaDetected && !keyaMotorFault) {
+            memcpy(KeyaBusSendData.buf, keyaResetPosition, 8);
+            if (Keya_Bus.write(KeyaBusSendData)) {
+                updateRawPositionOffset = false;
+                sendHardwareMessage("Keya zero reset; re-engage above 1.5 km/h", 3);
+            }
+        }
+        return;
+    }
+    disabledSent = false;
+    if (!keyaDetected || keyaMotorFault || updateRawPositionOffset ||
+        steerSettings.steerSensorCounts <= 0 || steerSettings.AckermanFix <= 0) return;
 
-
-			// and enable
-			memcpy(KeyaBusSendData.buf, keyaEnableCommand, 8);
-			Serial.print(" Enable: ");
-			dumpBuf(KeyaBusSendData.buf);
-			sendKeyaCommand();
-
-
-			Serial.println();
-			Serial.println("intended: " + String(intendedSteerAngle) + " slack: " + String(slack));
-
-		}
-	}
+    const uint16_t speedToSet = (uint16_t)(((uint32_t)steerSettings.AckermanFix * 10000u + 127u) / 200u);
+    if ((!enabled && !waiting) || speedToSet != lastSpeed) {
+        memcpy(KeyaBusSendData.buf, keyaSpeedCommand, 4);
+        packKeya32((int32_t)speedToSet, KeyaBusSendData.buf);
+        if (!Keya_Bus.write(KeyaBusSendData)) { keyaTxFault = true; return; }
+        lastSpeed = speedToSet;
+        speedSentAt = now;
+        waiting = true;
+    }
+    if (waiting && uint32_t(now - speedSentAt) < 100) return;
+    if (!enabled || waiting || steerAngleSetPoint != lastTarget ||
+        steerSettings.steerSensorCounts != lastScale || uint32_t(now - lastTargetAt) >= 100) {
+        // Preserve the upstream steering mapping; this change addresses motor
+        // permission and sequencing, not the experimental steering calibration.
+        int16_t slack = ((2 / steerSettings.AckermanFix) * 100);
+        if (intendedSteerAngle < 0) slack *= -1;
+        intendedSteerAngle = (steerAngleSetPoint * -1) + slack;
+        intendedAngleConverted = degreesToPosition(intendedSteerAngle + KeyaCenterOffset);
+        memcpy(KeyaBusSendData.buf, keyaPositionCommand, 4);
+        packKeya32((int32_t)intendedAngleConverted, KeyaBusSendData.buf);
+        if (!Keya_Bus.write(KeyaBusSendData)) { keyaTxFault = true; return; }
+        memcpy(KeyaBusSendData.buf, keyaEnableCommand, 8);
+        if (!Keya_Bus.write(KeyaBusSendData)) { keyaTxFault = true; return; }
+        waiting = false;
+        enabled = true;
+        lastTarget = steerAngleSetPoint;
+        lastScale = steerSettings.steerSensorCounts;
+        lastTargetAt = now;
+    }
 }
 
-// only issue one query at a time, wait for respone
 void sendKeyaCommand() {
-	Keya_Bus.write(KeyaBusSendData);
+    Keya_Bus.write(KeyaBusSendData);
 }
 
 #endif

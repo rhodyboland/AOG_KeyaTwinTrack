@@ -1,8 +1,8 @@
 
 // Serial Ports
 #define SerialAOG Serial               // AgIO USB conection
-#define SerialRTK Serial7 // aio board               //RTK radio (3 for AIO)
-HardwareSerial* SerialGPS = &Serial3;   //Main postion receiver (GGA) (7 for AIO)
+#define SerialRTK Serial3 // aio board               //RTK radio (3 for AIO)
+HardwareSerial* SerialGPS = &Serial7;   //Main postion receiver (GGA) (7 for AIO)
 HardwareSerial* SerialGPS2 = &Serial2; // Dual heading receiver
 HardwareSerial* SerialIMU = &Serial5;   //IMU
 
@@ -53,16 +53,18 @@ BNO080 bno08x;
 // CRX2/CTX2 on Teensy are CAN2 on AIO board, CAN2 on Tony's board
 // CRX3/CTX3 on Teensy are CAN1 on AIO board, CAN3 on Tony's board
 FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_256> Keya_Bus;
-int32_t intendedSteerAngle = 0;
+float intendedSteerAngle = 0;
 
 elapsedMillis lastKeyaHeatbeat;
 int16_t KeyaCenterOffset = 0;
 int16_t lastWASOffset = 0;
 bool updateRawPositionOffset = false;
 bool keyaDetected = false;
+bool keyaMotorFault = true;
+bool keyaTxFault = false;
 bool keyaIntendToSteer;
-int16_t keyaCurrentSteeringPositionScaled = 0;
-int32_t keyaCurrentSteerAngleScaled;
+float keyaCurrentSteeringPositionScaled = 0;
+float keyaCurrentSteerAngleScaled = 0;
 int16_t keyaCurrentActualSpeed = 0;
 int16_t keyaCurrentSetSpeed = 0; 
 
@@ -158,7 +160,7 @@ void setup()
 {
 	delay(500);               // Small delay so serial can monitor start up
 	set_arm_clock(450000000); // Set CPU speed to 150mhz
-	Serial.println("\r\n** Andy's TwinTrack experiments **\r\n");
+	Serial.println("\r\n** AW KeyaTwinTrack AIO45 Micro - precision v2 **\r\n");
 	Serial.print("CPU speed set to: ");
 	Serial.println(F_CPU_ACTUAL);
 
@@ -262,7 +264,7 @@ void loop()
 	updater.poll();
 	if (lastKeyaHeatbeat > 1000)
 	{
-		sendHardwareMessage("Keya CANBUS Lost", 3);
+		if (keyaDetected) sendHardwareMessage("Keya CANBUS Lost", 3);
 		keyaDetected = false;
 		intendedSteerAngle = 0;
 		keyaCurrentSteeringPositionScaled = 0;

@@ -17,7 +17,12 @@
 	 3921hz = 2
 */
 #define PWM_Frequency 1
-static int16_t lastSteerAngleSetPoint = 0;
+#include "SteeringSafety.h"
+#include "AogPacket.h"
+bool wasHealthy = true;
+SteeringSafety steeringSafety;
+uint8_t stableSteerPin = HIGH, lastRawSteerPin = HIGH;
+uint32_t steerPinChangedAt = 0;
 
 //WAS Calabration
 float inputWAS[] = { -50.00, -45.0, -40.0, -35.0, -30.0, -25.0, -20.0, -15.0, -10.0, -5.0, 0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0 };  //Input WAS do not adjust
@@ -51,10 +56,6 @@ const uint16_t LOOP_TIME = 25;  //40Hz
 uint32_t autsteerLastTime = LOOP_TIME;
 uint32_t currentTime = LOOP_TIME;
 
-const uint16_t WATCHDOG_THRESHOLD = 100;
-const uint16_t WATCHDOG_FORCE_VALUE = WATCHDOG_THRESHOLD + 2; // Should be greater than WATCHDOG_THRESHOLD
-uint8_t watchdogTimer = WATCHDOG_FORCE_VALUE;
-
 //Heart beat hello AgIO
 uint8_t helloFromIMU[] = { 128, 129, 121, 121, 5, 0, 0, 0, 0, 0, 71 };
 uint8_t helloFromAutoSteer[] = { 0x80, 0x81, 126, 126, 5, 0, 0, 0, 0, 0, 71 };
@@ -86,15 +87,15 @@ uint8_t remoteSwitch = 0, workSwitch = 0, steerSwitch = 1, switchByte = 0;
 
 //On Off
 uint8_t guidanceStatus = 0;
-uint8_t prevGuidanceStatus = 0;
-bool guidanceStatusChanged = false;
+
+
 
 //speed sent as *10
 float gpsSpeed = 0;
 
 //steering variables
-int16_t steerAngleActual = 0;
-int16_t steerAngleSetPoint = 0; //the desired angle from AgOpen
+float steerAngleActual = 0;
+float steerAngleSetPoint = 0; //the desired angle from AgOpen
 
 
 //Steer switch button  ***********************************************************************************************************
@@ -140,6 +141,8 @@ void autosteerSetup()
 	pinMode(WORKSW_PIN, INPUT_PULLUP);
 	pinMode(STEERSW_PIN, INPUT_PULLUP);
 	pinMode(REMOTE_PIN, INPUT_PULLUP);
+	stableSteerPin = lastRawSteerPin = digitalRead(STEERSW_PIN);
+	steerPinChangedAt = millis();
 
 	//set up communication
 	Wire1.end();
@@ -182,8 +185,9 @@ void autosteerLoop()
 
 	ReceiveUdp();
 	KeyaBus_Receive();
+    SteeringSafety::Action action = SteeringSafety::None;
 
-	// Loop triggers every 100 msec and sends back gyro heading, and roll, steer angle etc
+	// Input sampling and steering feedback update at 40 Hz; permission is checked every pass.
 	currentTime = systick_millis_count;
 
 	if (currentTime - autsteerLastTime >= LOOP_TIME)
@@ -193,103 +197,24 @@ void autosteerLoop()
 		//reset debounce
 		encEnable = true;
 
-		//If connection lost to AgOpenGPS, the watchdog will count up and turn off steering
-		if (watchdogTimer++ > 250)
-		{
-			watchdogTimer = WATCHDOG_FORCE_VALUE;
-			steerSwitch = 1; // reset values like it turned off
-			currentState = 1;
-			gpsSpeed = 0;
-		}
-
-		//read all the switches
-		workSwitch = digitalRead(WORKSW_PIN);       // read work switch
-
-		//Engage steering via 1 PCB Button or 2 Tablet
-
-		// 1 PCB Button pressed?
-		reading = digitalRead(STEERSW_PIN);
-		if (steerConfig.SteerSwitch == 1)
-		{
-			// Switch is off so reset ready for next switch on
-			if (reading == HIGH)
-			{
-				currentState = 1;
-				steerSwitch = 1;
-				previous = reading;
-			}
-		}
-
-		// 2 Has tablet button been pressed?
-		if (guidanceStatusChanged)
-		{
-			if (guidanceStatus == 1)    //Must have changed Off >> On
-			{
-				currentState = 0;
-				steerSwitch = 0;
-			}
-		}
-
-		// If AOG has stopped steering, wait then turn off steerswitch ready for next engage.
-		static int switchCounter = 0;
-
-		if (steerSwitch == 0 && guidanceStatus == 0)
-		{
-			if (switchCounter++ > 30)
-			{
-				currentState = 1;
-				steerSwitch = 1;
-			}
-		}
-		else
-		{
-			switchCounter = 0;
-		}
-
-		// Arduino software button code
-		if (reading == LOW && previous == HIGH)
-		{
-			if (currentState == 1)
-			{
-				currentState = 0;
-				steerSwitch = 0;
-			}
-			else
-			{
-				currentState = 1;
-				steerSwitch = 1;
-			}
-		}
-		previous = reading;
-
-		// Encoder sensor?
-		if (steerConfig.ShaftEncoder && pulseCount >= steerConfig.PulseCountMax)
-		{
-			steerSwitch = 1;
-			currentState = 1;
-			previous = 0;
-		}
-
-		// Current sensor?
-		if (steerConfig.CurrentSensor)
-		{
-			if (keyaDetected)
-			{
-				if (sensorReading >= steerConfig.PulseCountMax)
-				{
-					steerSwitch = 1;
-					currentState = 1;
-					previous = 0;
-				}
-			}
-		}
-
-		remoteSwitch = digitalRead(REMOTE_PIN);
-		switchByte = 0;
-		switchByte |= (remoteSwitch << 2);  //put remote in bit 2
-		switchByte |= (steerSwitch << 1);   //put steerswitch status in bit 1 position
-		switchByte |= workSwitch;
-
+        // Debounce both switch types; a held input at boot is not a new request.
+        workSwitch = digitalRead(WORKSW_PIN);
+        reading = digitalRead(STEERSW_PIN);
+        if (reading != lastRawSteerPin) {
+            lastRawSteerPin = reading;
+            steerPinChangedAt = millis();
+        }
+        if (reading != stableSteerPin && uint32_t(millis() - steerPinChangedAt) >= 30) {
+            stableSteerPin = reading;
+            if (steerConfig.SteerSwitch) {
+                action = reading == LOW ? SteeringSafety::Engage : SteeringSafety::Disengage;
+            } else if (steerConfig.SteerButton && reading == LOW) {
+                action = steeringSafety.requested ? SteeringSafety::Disengage : SteeringSafety::Engage;
+            }
+        }
+        // Maintained switch OFF always overrides tablet engagement.
+        if (steerConfig.SteerSwitch && stableSteerPin == HIGH)
+            action = SteeringSafety::Disengage;
 		// use Keya encoder
 		if (keyaDetected && !steerConfig.SingleInputWAS)
 		{
@@ -324,52 +249,28 @@ void autosteerLoop()
 			helloSteerPosition = keyaCurrentSteerAngleScaled;
 		}
 
-		//WAS fault or over 25km, cut steering
-		if ((steerAngleActual < inputWAS[0]) || (steerAngleActual > inputWAS[20]) || gpsSpeed > 25)
-		{
-			steerSwitch = 1; // reset values like it turned off
-			currentState = 1;
-			previous = 0;
-			watchdogTimer = WATCHDOG_FORCE_VALUE;
-		}
-
-		//Map WAS
-		float mappedWAS = multiMap<float>(steerAngleActual, inputWAS, outputWAS, 21);
-		steerAngleActual = mappedWAS;
-
-		if (watchdogTimer < WATCHDOG_THRESHOLD)
-		{
-			//if (abs(steerAngleError)< steerSettings.lowPWM) steerAngleError = 0;
-
-			//Don't turn wheels if speed less than 1km/hr (build in a bit of error, twin-track could be very dangerous!)
-			if (gpsSpeed < -1) {  // andy undo this hack!!!
-				keyaIntendToSteer = false;
-				sendHardwareMessage("Not moving, so not steering!", 2);
-				SteerKeya(false);
-			}
-			else {
-				keyaIntendToSteer = true;
-				//Serial.print(millis());
-				//Serial.println(" lastSteerAngleSetPoint: " + String(lastSteerAngleSetPoint) + ", steerAngleSetPoint: " + String(steerAngleSetPoint));
-				const int16_t deadBand = 0; // degrees
-				if (abs(steerAngleSetPoint - lastSteerAngleSetPoint) > deadBand) {
-					lastSteerAngleSetPoint = steerAngleSetPoint;
-					SteerKeya(true);
-				}
-				// Autosteer Led goes GREEN if autosteering
-				digitalWrite(AUTOSTEER_ACTIVE_LED, 1);
-				digitalWrite(AUTOSTEER_STANDBY_LED, 0);
-			}
-		}
-		else
-		{
-			keyaIntendToSteer = false;
-			SteerKeya(false);
-			// Autosteer Led goes back to RED when autosteering is stopped
-			digitalWrite(AUTOSTEER_STANDBY_LED, 1);
-			digitalWrite(AUTOSTEER_ACTIVE_LED, 0);
-		}
+        wasHealthy = steerAngleActual >= inputWAS[0] && steerAngleActual <= inputWAS[20];
+        float mappedWAS = multiMap<float>(steerAngleActual, inputWAS, outputWAS, 21);
+        steerAngleActual = mappedWAS;
 	} //end of timed loop
+
+    // Revalidate on EVERY pass before servicing any pending motor enable.
+    const bool takeover = (steerConfig.ShaftEncoder && pulseCount >= steerConfig.PulseCountMax) ||
+        (steerConfig.CurrentSensor && keyaDetected && sensorReading >= steerConfig.PulseCountMax);
+    const bool motorHealthy = keyaDetected && lastKeyaHeatbeat < 1000 && !keyaMotorFault && !keyaTxFault;
+    steeringSafety.update(millis(), motorHealthy && wasHealthy && !takeover &&
+        steerSettings.steerSensorCounts > 0 && steerSettings.AckermanFix > 0 && !updateRawPositionOffset, action);
+    keyaIntendToSteer = steeringSafety.motorAllowed;
+    steerSwitch = steeringSafety.requested ? 0 : 1;
+    currentState = steerSwitch;
+    if (!steeringSafety.requested) pulseCount = 0;
+    remoteSwitch = digitalRead(REMOTE_PIN);
+    switchByte = (remoteSwitch << 2) | (steerSwitch << 1) | workSwitch;
+    digitalWrite(AUTOSTEER_ACTIVE_LED, keyaIntendToSteer ? 1 : 0);
+    digitalWrite(AUTOSTEER_STANDBY_LED, keyaIntendToSteer ? 0 : 1);
+
+    // Nonblocking motor sequencer; disable cancels a pending enable.
+    SteerKeya(keyaIntendToSteer);
 
 	//This runs continuously, outside of the timed loop, keeps checking for new udpData, turn sense
 	//delay(1);
@@ -427,7 +328,8 @@ void ReceiveUdp()
 	// Check for len > 4, because we check byte 0, 1, 3 and 3
 	if (len > 4)
 	{
-		Eth_udpAutoSteer.read(autoSteerUdpData, UDP_TX_PACKET_MAX_SIZE);
+		const int received = Eth_udpAutoSteer.read(autoSteerUdpData, sizeof(autoSteerUdpData));
+        if (received != len || len > sizeof(autoSteerUdpData) || !validAogPacket(autoSteerUdpData, len)) return;
 
 		if (autoSteerUdpData[0] == 0x80 && autoSteerUdpData[1] == 0x81 && autoSteerUdpData[2] == 0x7F) //Data
 		{
@@ -436,25 +338,14 @@ void ReceiveUdp()
 				gpsSpeed = ((float)(autoSteerUdpData[5] | autoSteerUdpData[6] << 8)) * 0.1;
 				gpsSpeedUpdateTimer = 0;
 
-				prevGuidanceStatus = guidanceStatus;
-
 				guidanceStatus = autoSteerUdpData[7];
-				guidanceStatusChanged = (guidanceStatus != prevGuidanceStatus);
+				steeringSafety.command(millis(), gpsSpeed, bitRead(guidanceStatus, 0) != 0);
 
 				//Bit 8,9    set point steer angle * 100 is sent
-				steerAngleSetPoint = ((float)(autoSteerUdpData[8] | ((int8_t)autoSteerUdpData[9]) << 8)) * 0.01; //high low bytes
+				steerAngleSetPoint = decodeSteerDegrees(autoSteerUdpData[8], autoSteerUdpData[9]); //high low bytes
 
 				XTE = autoSteerUdpData[9];
 				//Serial.println(gpsSpeed);
-
-				if ((bitRead(guidanceStatus, 0) == 0) /* || (gpsSpeed < 0.1)*/ || (steerSwitch == 1)) // AW HACK
-				{
-					watchdogTimer = WATCHDOG_FORCE_VALUE; //turn off steering motor
-				}
-				else          //valid conditions to turn on autosteer
-				{
-					watchdogTimer = 0;  //reset watchdog
-				}
 
 				//Bit 10 Tram
 				tram = autoSteerUdpData[10];
