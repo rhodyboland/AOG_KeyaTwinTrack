@@ -59,9 +59,12 @@ twin-track calibration procedure.
 
 1. **Confirmed packet incompatibility:** the supplied validator accepts PGN 251
    only at 14 bytes. This app emits 11 bytes (five payload bytes plus framing and
-   checksum). The handler only needs fields through byte 8. A follow-up fix
-   should accept the app's 11-byte form as well as the existing 14-byte form,
-   preserving header, declared-size and checksum checks.
+   checksum). The handler only needs fields through byte 8. The follow-up commit
+   accepts the app's 11-byte form as well as the existing 14-byte form,
+   preserving header, declared-size and checksum checks. An independent wire
+   fixture matching the app builder failed against the imported validator and
+   passed after this change; truncated, bad-checksum, bad-declared-length and
+   other config packet sizes are rejected.
 2. **Nonzero and history-dependent centre:** upstream slack sign is selected
    using the *previous* intended angle, then added to the new negated request.
    At Ackermann 50 the magnitude is 4 equivalent degrees, so a zero request
@@ -84,6 +87,7 @@ twin-track calibration procedure.
 - Both supplied HEX/BIN SHA-256 checks passed.
 - Original host suites passed with `-Wall -Wextra -Werror` and ASan/UBSan.
 - Source comparison against the fork and local app protocol review completed.
+- Migrated host suites and PGN 251 regression cases passed with ASan/UBSan.
 - No Arduino CLI, Teensy core, NativeEthernet or FlexCAN_T4 installation was
   found locally. A fresh target build could not be reproduced; the original
   package's successful build log is historical evidence only.

@@ -7,7 +7,10 @@ inline bool validAogPacket(const uint8_t* p, size_t n) {
     for (size_t i = 2; i < n - 1; ++i) sum += p[i];
     if (sum != p[n - 1]) return false;
     switch (p[3]) {
-    case 0xFE: case 0xFC: case 0xFB: return n == 14;
+    case 0xFE: case 0xFC: return n == 14;
+    // AgOpenWeb uses the five-byte config payload; retain the extended
+    // eight-byte form accepted by the imported firmware as well.
+    case 0xFB: return n == 11 || n == 14;
     case 233: return n >= 11;
     case 201: return n == 11;
     case 202: return n == 9;
